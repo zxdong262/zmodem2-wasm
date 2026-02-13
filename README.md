@@ -35,19 +35,28 @@ The repository includes a full demo showing how to use `zmodem2-wasm` with `xter
    npm install
    ```
 
-2. **Start the Backend**:
+2. **Start the Docker Test Server** (Optional):
+   For testing ZMODEM file transfers, you can run a Docker-based SSH server with ZMODEM support.
+   ```bash
+   cd src/dockers
+   ./build.sh
+   ./run.sh
+   ```
+   This will start an SSH server on port 23355 with user `zxd` (password: `zxd`) or `root` (password: `root`).
+
+3. **Start the Backend**:
    The backend handles SSH/Terminal sessions.
    ```bash
    npm run backend
    ```
 
-3. **Start the Frontend**:
+4. **Start the Frontend**:
    This will build the WASM and start the Vite dev server.
    ```bash
    npm start
    ```
 
-4. **Access the Demo**:
+5. **Access the Demo**:
    Open your browser at `http://localhost:3002`.
 
 ## Usage

@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  zmodem-test-server:
+    build: .
+    ports:
+      - "23355:22"
+    container_name: zmodem-test-server
+    restart: unless-stopped

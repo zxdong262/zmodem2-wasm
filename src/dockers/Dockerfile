@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y openssh-server lrzsz && \
 # Create user zxd
 RUN useradd -m -s /bin/bash zxd && echo 'zxd:zxd' | chpasswd
 
-# Expose port 22, but we'll map to 23355
+# Expose port 22 for SSH
 EXPOSE 22
 
 CMD ["/usr/sbin/sshd", "-D"]
