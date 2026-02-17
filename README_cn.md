@@ -106,3 +106,13 @@ socket.send(outgoing);
 ## 许可证
 
 MIT OR Apache-2.0 (与 zmodem2 相同)
+
+---
+
+## 其他解决方案：zmodem2-js
+
+[zmodem2-js](https://github.com/zxdong262/zmodem2-js) 是另一个基于 [zmodem2](https://codeberg.org/jarkko/zmodem2) Rust crate 移植的纯 JavaScript 版本。
+
+该项目无需 WebAssembly，适用于需要纯 JS 实现的场景。功能与 zmodem2-wasm 类似，适合在 Node.js 或浏览器环境下直接使用。
+
+项目地址：[https://github.com/zxdong262/zmodem2-js](https://github.com/zxdong262/zmodem2-js)

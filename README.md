@@ -115,3 +115,13 @@ socket.send(outgoing);
 ## License
 
 MIT OR Apache-2.0 (same as zmodem2)
+
+---
+
+## Other Solution: zmodem2-js
+
+[zmodem2-js](https://github.com/zxdong262/zmodem2-js) is another solution ported from the [zmodem2](https://codeberg.org/jarkko/zmodem2) Rust crate, implemented in pure JavaScript.
+
+This project does not require WebAssembly and is suitable for scenarios where a pure JS implementation is needed. It provides similar functionality to zmodem2-wasm and can be used directly in Node.js or browser environments.
+
+Project link: [https://github.com/zxdong262/zmodem2-js](https://github.com/zxdong262/zmodem2-js)
