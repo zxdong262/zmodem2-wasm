@@ -149,21 +149,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "zmodem2"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "515c519057f07982ebb6eed12d5316a52ee563b004cf08961019166e33a7cc9d"
-dependencies = [
- "bitflags",
- "hex",
- "thiserror",
-]
-
-[[package]]
 name = "zmodem2-wasm"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
+ "hex",
  "js-sys",
+ "thiserror",
  "wasm-bindgen",
- "zmodem2",
 ]

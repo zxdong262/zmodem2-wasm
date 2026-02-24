@@ -11,13 +11,22 @@ export default class AddonZmodemWasm {
   onDetect: ((type: 'receive' | 'send') => void) | null = null
   isPickingFile = false
   
-  // FIX: Add a flag to prevent concurrent reads
+  // Double buffering for efficient large file uploads
+  _currentBuffer: Uint8Array | null = null
+  _currentBufferOffset = 0
+  _nextBuffer: Uint8Array | null = null
+  _nextBufferOffset = 0
   _reading = false
+  _preloading = false
   
-  // Buffer for read-ahead
-  _fileBuffer: Uint8Array | null = null
-  _fileBufferOffset = 0
-  readonly BUFFER_SIZE = 10 * 1024 * 1024 // 10MB
+  // Threshold: files smaller than this get fully preloaded
+  readonly SMALL_FILE_THRESHOLD = 50 * 1024 * 1024 // 50MB
+  // Buffer size for large files
+  readonly BUFFER_SIZE = 32 * 1024 * 1024 // 32MB
+  
+  // For small files, preload entire content
+  _preloadedFile: Uint8Array | null = null
+  _preloadedFileSize = 0
   
   currentFile: { name: string, size: number, data: Uint8Array[] } | null = null
   sendingFile: File | null = null
@@ -50,7 +59,9 @@ export default class AddonZmodemWasm {
   dispose() {
     this.receiver = null
     this.sender = null
-    this._fileBuffer = null
+    this._currentBuffer = null
+    this._nextBuffer = null
+    this._preloadedFile = null
     this._disposables.forEach(d => d.dispose())
     this._disposables = []
   }
@@ -132,25 +143,82 @@ export default class AddonZmodemWasm {
       this.sendingFile = file
       this.sender = new WasmSender()
       this._reading = false
-      this._fileBuffer = null
-      this._fileBufferOffset = 0
+      this._preloading = false
+      this._currentBuffer = null
+      this._currentBufferOffset = 0
+      this._nextBuffer = null
+      this._nextBufferOffset = 0
       this.senderStartTime = Date.now()
       this.senderBytesSent = 0
       this.senderLastLogTime = 0
       
       this.term?.writeln(`\r\n[ZMODEM] Starting Sender for ${file.name} (${file.size} bytes)`)
+      
       try {
+          // For small files, preload entire file into memory
+          if (file.size <= this.SMALL_FILE_THRESHOLD) {
+              this.term?.writeln(`\r\n[ZMODEM] Small file, preloading into memory...`)
+              const arrayBuffer = await file.arrayBuffer()
+              this._preloadedFile = new Uint8Array(arrayBuffer)
+              this._preloadedFileSize = file.size
+              this.term?.writeln(`\r\n[ZMODEM] File preloaded (${this._preloadedFile.length} bytes)`)
+          } else {
+              // For large files, use double buffering
+              this.term?.writeln(`\r\n[ZMODEM] Large file, using double buffering...`)
+              // Preload first buffer
+              await this.loadInitialBuffer()
+          }
+          
           this.sender.start_file(file.name, file.size)
           this.pumpSender()
       } catch (e) {
           console.error('Failed to start sender', e)
           this.sender = null
+          this._preloadedFile = null
+      }
+  }
+
+  async loadInitialBuffer() {
+      if (!this.sendingFile) return
+      
+      const end = Math.min(this.BUFFER_SIZE, this.sendingFile.size)
+      const slice = this.sendingFile.slice(0, end)
+      const buffer = await slice.arrayBuffer()
+      
+      this._currentBuffer = new Uint8Array(buffer)
+      this._currentBufferOffset = 0
+      
+      // Start preloading next buffer in background
+      this.preloadNextBuffer(end)
+  }
+
+  async preloadNextBuffer(offset: number) {
+      if (!this.sendingFile || this._preloading) return
+      if (offset >= this.sendingFile.size) return
+      
+      this._preloading = true
+      
+      try {
+          const end = Math.min(offset + this.BUFFER_SIZE, this.sendingFile.size)
+          const slice = this.sendingFile.slice(offset, end)
+          const buffer = await slice.arrayBuffer()
+          
+          this._nextBuffer = new Uint8Array(buffer)
+          this._nextBufferOffset = offset
+          
+          // console.log(`Preloaded buffer at offset ${offset}, size ${this._nextBuffer.length}`)
+      } catch (e) {
+          console.error('Preload error:', e)
+      } finally {
+          this._preloading = false
       }
   }
 
   handleSender(data: ArrayBuffer | Uint8Array | string) {
       if (!this.sender) return
       const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data)
+
+      console.log(`[DEBUG] handleSender: received ${u8.length} bytes`)
       
       let offset = 0
       let loopCount = 0
@@ -160,25 +228,38 @@ export default class AddonZmodemWasm {
           try {
               const chunk = u8.subarray(offset)
               const consumed = this.sender.feed(chunk)
+              console.log(`[DEBUG] feed consumed ${consumed} bytes`)
               offset += consumed
               
               const drained = this.pumpSender()
               
-              // If we didn't consume input and didn't generate output/events, we are stuck.
-              if (consumed === 0 && !drained) {
-                  // But maybe the sender is just waiting for file data and can't consume more ACKs?
-                  if (loopCount > 1) console.warn('Sender stuck: 0 consumed, 0 drained')
-                  break
+              // If we didn't consume input, try to pump more data
+              // The sender might be waiting for file data
+              if (consumed === 0) {
+                  // Try to pump one more time in case there's pending work
+                  if (!drained) {
+                      // Still no progress, but don't break immediately
+                      // The sender might need more input data
+                      if (offset < u8.length) {
+                          // There's more input, continue trying
+                          continue
+                      }
+                      break
+                  }
               }
           } catch (e) {
               console.error('Sender error:', e)
               this.term?.writeln('\r\nZMODEM Sender Error: ' + e)
               this.sender = null
               this.sendingFile = null
-              this._fileBuffer = null
+              this._currentBuffer = null
+              this._nextBuffer = null
+              this._preloadedFile = null
               break
           }
       }
+      
+      console.log(`[DEBUG] handleSender done: processed ${offset}/${u8.length} bytes`)
   }
 
   pumpSender(): boolean {
@@ -188,9 +269,13 @@ export default class AddonZmodemWasm {
       const outgoingChunks: Uint8Array[] = []
       let totalOutgoingSize = 0
       const FLUSH_THRESHOLD = 64 * 1024 // 64KB
+      
+      let needFileDataCount = 0
+      let totalDataSent = 0
 
       const flushOutgoing = () => {
           if (outgoingChunks.length === 0) return
+          console.log(`[DEBUG] Sending ${totalOutgoingSize} bytes, ${outgoingChunks.length} chunks`)
           if (outgoingChunks.length === 1) {
               this.socket?.send(outgoingChunks[0])
           } else {
@@ -213,27 +298,52 @@ export default class AddonZmodemWasm {
               if (!event) break
 
               const e = event as any
-            //   console.log('WASM Sender Event:', e)
               didWork = true
 
               if (e.type === 'need_file_data') {
                   const start = e.offset
                   const length = e.length
-                  this.term?.writeln(`\r[ZMODEM] Requesting data: offset=${start}, length=${length}`)
 
-                  // 1. Try to serve from buffer synchronously
-                  if (this._fileBuffer && 
-                      start >= this._fileBufferOffset && 
-                      (start + length) <= (this._fileBufferOffset + this._fileBuffer.byteLength)) {
-                      
-                      const relativeStart = start - this._fileBufferOffset
-                      const chunk = this._fileBuffer.subarray(relativeStart, relativeStart + length)
+                  needFileDataCount++
+                  totalDataSent += length
+                  
+                  // Debug: log request size
+                  console.log(`[DEBUG] need_file_data #${needFileDataCount}: offset=${start}, length=${length}, preloaded=${!!this._preloadedFile}`)
+
+                  // 1. Fast path: serve from preloaded small file (synchronous)
+                  if (this._preloadedFile && start + length <= this._preloadedFileSize) {
+                      const chunk = this._preloadedFile.subarray(start, start + length)
                       this.sender.feed_file(chunk)
                       
                       this.senderBytesSent = start + length
                       this.logSenderProgress()
 
-                      // IMPORTANT: Drain outgoing data immediately after feeding
+                      const outgoing = this.sender.drain_outgoing()
+                      if (outgoing && outgoing.length > 0) {
+                          console.log(`[DEBUG] drain_outgoing after feed: ${outgoing.length} bytes`)
+                          outgoingChunks.push(outgoing)
+                          totalOutgoingSize += outgoing.length
+                          
+                          if (totalOutgoingSize > FLUSH_THRESHOLD) {
+                              flushOutgoing()
+                          }
+                      }
+                      
+                      continue
+                  }
+
+                  // 2. Try current buffer (synchronous)
+                  if (this._currentBuffer && 
+                      start >= this._currentBufferOffset && 
+                      (start + length) <= (this._currentBufferOffset + this._currentBuffer.byteLength)) {
+                      
+                      const relativeStart = start - this._currentBufferOffset
+                      const chunk = this._currentBuffer.subarray(relativeStart, relativeStart + length)
+                      this.sender.feed_file(chunk)
+                      
+                      this.senderBytesSent = start + length
+                      this.logSenderProgress()
+
                       const outgoing = this.sender.drain_outgoing()
                       if (outgoing && outgoing.length > 0) {
                           outgoingChunks.push(outgoing)
@@ -244,21 +354,51 @@ export default class AddonZmodemWasm {
                           }
                       }
                       
-                      // Continue loop synchronously
                       continue
                   }
 
-                  // 2. Not in buffer, need to load
-                  // FIX: Check if we are already reading to avoid race conditions
-                  if (this.sendingFile && !this._reading) {
-                      flushOutgoing() // Flush before async break
-                      this._reading = true // Lock
-                      this.loadBufferAndFeed(start, length)
+                  // 3. Try next buffer (swap buffers - synchronous if already loaded)
+                  if (this._nextBuffer && 
+                      start >= this._nextBufferOffset && 
+                      (start + length) <= (this._nextBufferOffset + this._nextBuffer.byteLength)) {
                       
-                      // Break loop to wait for async read
-                      break 
+                      // Swap buffers
+                      this._currentBuffer = this._nextBuffer
+                      this._currentBufferOffset = this._nextBufferOffset
+                      this._nextBuffer = null
+                      
+                      // Start preloading next chunk
+                      this.preloadNextBuffer(this._currentBufferOffset + this._currentBuffer.length)
+                      
+                      // Now serve from current buffer
+                      const relativeStart = start - this._currentBufferOffset
+                      const chunk = this._currentBuffer.subarray(relativeStart, relativeStart + length)
+                      this.sender.feed_file(chunk)
+                      
+                      this.senderBytesSent = start + length
+                      this.logSenderProgress()
+
+                      const outgoing = this.sender.drain_outgoing()
+                      if (outgoing && outgoing.length > 0) {
+                          outgoingChunks.push(outgoing)
+                          totalOutgoingSize += outgoing.length
+                          
+                          if (totalOutgoingSize > FLUSH_THRESHOLD) {
+                              flushOutgoing()
+                          }
+                      }
+                      
+                      continue
+                  }
+
+                  // 4. Data not in any buffer - need to load synchronously
+                  // This should rarely happen with proper preloading
+                  if (this.sendingFile && !this._reading) {
+                      flushOutgoing()
+                      this._reading = true
+                      this.loadBufferAndFeed(start, length)
+                      break
                   } else if (this._reading) {
-                      // Already reading, break loop and wait for that to finish
                       break
                   }
               } else if (e.type === 'file_complete') {
@@ -268,8 +408,11 @@ export default class AddonZmodemWasm {
                   this.term?.writeln('\r\nZMODEM: Session complete.')
                   this.sender = null
                   this.sendingFile = null
-                  this._fileBuffer = null
-                  flushOutgoing() // Flush final packets
+                  this._currentBuffer = null
+                  this._nextBuffer = null
+                  this._preloadedFile = null
+                  this._preloadedFileSize = 0
+                  flushOutgoing()
                   return true
               }
           }
@@ -277,9 +420,15 @@ export default class AddonZmodemWasm {
           console.error('Pump Sender Error:', e)
           this.term?.writeln('\r\nZMODEM Pump Error: ' + e)
           this.sender = null
+          this._preloadedFile = null
       }
       
-      flushOutgoing() // Flush anything remaining at end of loop
+      flushOutgoing()
+      
+      if (needFileDataCount > 0) {
+          console.log(`[DEBUG] pumpSender done: ${needFileDataCount} need_file_data events, ${totalDataSent} bytes total`)
+      }
+      
       return didWork
   }
 
@@ -289,7 +438,7 @@ export default class AddonZmodemWasm {
           return
       }
       try {
-          // Read a larger chunk to minimize I/O and async overhead
+          // Read a larger chunk
           const readSize = Math.max(length, this.BUFFER_SIZE)
           const end = Math.min(offset + readSize, this.sendingFile.size)
           const slice = this.sendingFile.slice(offset, end)
@@ -298,34 +447,29 @@ export default class AddonZmodemWasm {
           if (!this.sender) return
           const u8 = new Uint8Array(buffer)
 
-          // Update buffer
-          this._fileBuffer = u8
-          this._fileBufferOffset = offset
+          // Update current buffer
+          this._currentBuffer = u8
+          this._currentBufferOffset = offset
 
           // Feed the requested part
-          // Since we read from 'offset', the requested data starts at 0 in the new buffer
-          // Note: u8.length might be less than length if we hit EOF
           const feedLen = Math.min(length, u8.length)
           const chunk = u8.subarray(0, feedLen)
           
           this.sender.feed_file(chunk)
           
           this.senderBytesSent = offset + feedLen
-          if (this.senderBytesSent % (1024 * 1024) === 0 || this.senderBytesSent === this.sendingFile?.size) {
-              this.logSenderProgress()
-          }
+          this.logSenderProgress()
           
-          // Unlock BEFORE pumping
-          this._reading = false 
+          // Start preloading next buffer
+          this.preloadNextBuffer(offset + u8.length)
+          
+          // Unlock
+          this._reading = false
           
           this.pumpSender()
       } catch (e) {
           console.error('Buffer read error', e)
-          
-          // Ensure we unlock on error
           this._reading = false
-          
-          // Try to pump again to see if we can recover
           try { this.pumpSender() } catch (_) {}
       }
   }
@@ -334,7 +478,11 @@ export default class AddonZmodemWasm {
       if (!this.sendingFile || !this.term) return
       
       const now = Date.now()
-      const timeSinceLastLog = now - this.senderLastLogTime
+      
+      // Only log every 500ms to reduce overhead
+      if (now - this.senderLastLogTime < 500 && this.senderBytesSent < this.sendingFile.size) {
+          return
+      }
       
       const percent = ((this.senderBytesSent / this.sendingFile.size) * 100).toFixed(2)
       const elapsed = (now - this.senderStartTime) / 1000
@@ -348,7 +496,11 @@ export default class AddonZmodemWasm {
       if (!this.currentFile || !this.term) return
       
       const now = Date.now()
-      const timeSinceLastLog = now - this.receiverLastLogTime
+      
+      // Only log every 500ms to reduce overhead
+      if (now - this.receiverLastLogTime < 500 && this.receiverBytesReceived < this.currentFile.size) {
+          return
+      }
       
       const percent = ((this.receiverBytesReceived / this.currentFile.size) * 100).toFixed(2)
       const elapsed = (now - this.receiverStartTime) / 1000
@@ -413,7 +565,6 @@ export default class AddonZmodemWasm {
             if (!event) break
             
             const e = event as any
-            console.log('WASM Event:', e)
             didWork = true
             
             if (e.type === 'file_start') {
@@ -422,7 +573,6 @@ export default class AddonZmodemWasm {
                 this.receiverStartTime = Date.now()
                 this.receiverBytesReceived = 0
                 this.receiverLastLogTime = 0
-                this.term?.writeln(`\r[ZMODEM] Receiver initialized for ${e.name}`)
             } else if (e.type === 'file_complete') {
                 this.term?.writeln('\r\nZMODEM: File complete.')
                 this.saveFile()
