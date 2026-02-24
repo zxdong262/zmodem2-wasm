@@ -18,12 +18,14 @@ use super::{ZDLE, ZPAD};
 use core::cmp::min;
 use core::fmt::Write as _;
 
-/// Size of the unescaped subpacket payload. The size is picked from the
-/// original ZMODEM specification.
-const SUBPACKET_MAX_SIZE: usize = 1024;
-/// Number of subpackets per ACK. Increased from 10 to 100 for better throughput
+/// Size of the unescaped subpacket payload.
+/// Increased from 1024 to 8192 for better throughput over high-latency connections.
+/// ZMODEM spec allows up to 8KB subpackets with ZCRCW encoding.
+const SUBPACKET_MAX_SIZE: usize = 8192;
+/// Number of subpackets per ACK. Increased from 10 to 200 for better throughput
 /// over high-latency connections (WebSocket/SSH tunneling).
-const SUBPACKET_PER_ACK: usize = 100;
+/// This allows ~1.6MB per ACK cycle (200 * 8KB).
+const SUBPACKET_PER_ACK: usize = 200;
 const MAX_HEADER_ESCAPED: usize = 128;
 const MAX_SUBPACKET_ESCAPED: usize = SUBPACKET_MAX_SIZE * 2 + 2 + 8;
 const WIRE_BUF_SIZE: usize = MAX_HEADER_ESCAPED + MAX_SUBPACKET_ESCAPED;
@@ -726,25 +728,15 @@ impl Sender {
 
     fn update_receiver_caps(&mut self, header: Header) {
         let flags = header.count().to_le_bytes();
-        let rx_buf_size = u16::from_le_bytes([flags[0], flags[1]]) as usize;
         let caps = flags[2] | flags[3];
         let can_ovio = (caps & Zrinit::CANOVIO.bits()) != 0;
 
-        if rx_buf_size == 0 {
-            self.max_subpacket_size = SUBPACKET_MAX_SIZE;
-            self.max_subpackets_per_ack = if can_ovio { SUBPACKET_PER_ACK } else { 1 };
-            return;
-        }
-
-        self.max_subpacket_size = min(SUBPACKET_MAX_SIZE, rx_buf_size);
-        if !can_ovio {
-            self.max_subpackets_per_ack = 1;
-            return;
-        }
-
-        // Use the minimum of receiver's buffer capacity and our optimized SUBPACKET_PER_ACK
-        let subpackets = rx_buf_size / self.max_subpacket_size;
-        self.max_subpackets_per_ack = min(SUBPACKET_PER_ACK, if subpackets == 0 { 1 } else { subpackets });
+        // Always use the maximum subpacket size for efficiency
+        self.max_subpacket_size = SUBPACKET_MAX_SIZE;
+        
+        // Use our optimized SUBPACKET_PER_ACK if receiver supports overlapped I/O
+        // Ignore rx_buf_size limitation as it's mainly for flow control, not throughput
+        self.max_subpackets_per_ack = if can_ovio { SUBPACKET_PER_ACK } else { 1 };
     }
 
     fn on_zrpos(&mut self, offset: u32) -> Result<(), Error> {

@@ -1,6 +1,6 @@
 {
   "name": "zmodem2-wasm",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "WebAssembly compilation of the zmodem2 Rust crate by Jarkko Sakkinen (https://codeberg.org/jarkko/zmodem2)",
     "scripts": {
     "dev:ts": "vite --config build/vite.config.ts",

@@ -2,4 +2,5 @@
 
 mod external;
 
+#[cfg(target_arch = "wasm32")]
 pub use external::{WasmReceiver, WasmSender};
