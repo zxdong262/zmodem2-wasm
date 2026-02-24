@@ -2,14 +2,42 @@ import express from 'express'
 import expressWs from 'express-ws'
 import { Client } from 'ssh2'
 import WebSocket from 'ws'
+import fs from 'fs'
+import dotenv from 'dotenv'
+
+dotenv.config()
 
 const app = express()
 expressWs(app)
 
-const SSH_HOST = 'localhost'
-const SSH_PORT = 23355
-const SSH_USER = 'zxd'
-const SSH_PASS = 'zxd'
+function getSshConfig() {
+  const host = process.env.SSH_HOST || process.env.TEST_HOST || 'localhost'
+  const port = parseInt(process.env.SSH_PORT || process.env.TEST_PORT || '22', 10)
+  const user = process.env.SSH_USER || process.env.TEST_USER || 'root'
+  const password = process.env.SSH_PASS || process.env.TEST_PASS
+  const privateKeyPath = process.env.SSH_KEY_PATH || process.env.TEST_KEY_PATH
+
+  const config: any = {
+    host,
+    port,
+    username: user
+  }
+
+  if (privateKeyPath) {
+    try {
+      config.privateKey = fs.readFileSync(privateKeyPath)
+    } catch (err) {
+      console.error('Failed to read private key file:', err)
+      throw new Error(`Cannot read private key from ${privateKeyPath}`)
+    }
+  } else if (password) {
+    config.password = password
+  } else {
+    throw new Error('Either SSH_KEY_PATH or SSH_PASS must be provided')
+  }
+
+  return config
+}
 
 // Test SSH connection on startup
 console.log('Testing SSH connection...')
@@ -18,15 +46,10 @@ testSsh.on('ready', () => {
   console.log('SSH test connection successful')
   testSsh.end()
 })
-testSsh.on('error', (err) => {
+testSsh.on('error', (err: any) => {
   console.error('SSH test connection failed:', err)
 })
-testSsh.connect({
-  host: SSH_HOST,
-  port: SSH_PORT,
-  username: SSH_USER,
-  password: SSH_PASS
-})
+testSsh.connect(getSshConfig())
 
 app.ws('/terminal', (ws: WebSocket, req) => {
   console.log('WebSocket connection established from:', req.connection.remoteAddress)
@@ -84,18 +107,13 @@ app.ws('/terminal', (ws: WebSocket, req) => {
     })
   })
 
-  ssh.on('error', (err) => {
+  ssh.on('error', (err: any) => {
     console.error('SSH connection error:', err)
     ws.send(`SSH connection failed: ${err.message}`)
     ws.close(1011, 'SSH connection failed') // 1011 = Internal Error
   })
 
-  ssh.connect({
-    host: SSH_HOST,
-    port: SSH_PORT,
-    username: SSH_USER,
-    password: SSH_PASS
-  })
+  ssh.connect(getSshConfig())
 
   ws.on('close', () => {
     console.log('WebSocket closed')

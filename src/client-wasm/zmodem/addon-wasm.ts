@@ -22,6 +22,13 @@ export default class AddonZmodemWasm {
   currentFile: { name: string, size: number, data: Uint8Array[] } | null = null
   sendingFile: File | null = null
 
+  senderStartTime: number = 0
+  senderBytesSent: number = 0
+  senderLastLogTime: number = 0
+  receiverStartTime: number = 0
+  receiverBytesReceived: number = 0
+  receiverLastLogTime: number = 0
+
   constructor() {
     this.initWasm()
   }
@@ -124,11 +131,14 @@ export default class AddonZmodemWasm {
       this.isPickingFile = false
       this.sendingFile = file
       this.sender = new WasmSender()
-      this._reading = false // Reset reading state
+      this._reading = false
       this._fileBuffer = null
       this._fileBufferOffset = 0
+      this.senderStartTime = Date.now()
+      this.senderBytesSent = 0
+      this.senderLastLogTime = 0
       
-      console.log(`Starting Sender for ${file.name} (${file.size} bytes)`)
+      this.term?.writeln(`\r\n[ZMODEM] Starting Sender for ${file.name} (${file.size} bytes)`)
       try {
           this.sender.start_file(file.name, file.size)
           this.pumpSender()
@@ -209,6 +219,7 @@ export default class AddonZmodemWasm {
               if (e.type === 'need_file_data') {
                   const start = e.offset
                   const length = e.length
+                  this.term?.writeln(`\r[ZMODEM] Requesting data: offset=${start}, length=${length}`)
 
                   // 1. Try to serve from buffer synchronously
                   if (this._fileBuffer && 
@@ -218,6 +229,9 @@ export default class AddonZmodemWasm {
                       const relativeStart = start - this._fileBufferOffset
                       const chunk = this._fileBuffer.subarray(relativeStart, relativeStart + length)
                       this.sender.feed_file(chunk)
+                      
+                      this.senderBytesSent = start + length
+                      this.logSenderProgress()
 
                       // IMPORTANT: Drain outgoing data immediately after feeding
                       const outgoing = this.sender.drain_outgoing()
@@ -296,6 +310,11 @@ export default class AddonZmodemWasm {
           
           this.sender.feed_file(chunk)
           
+          this.senderBytesSent = offset + feedLen
+          if (this.senderBytesSent % (1024 * 1024) === 0 || this.senderBytesSent === this.sendingFile?.size) {
+              this.logSenderProgress()
+          }
+          
           // Unlock BEFORE pumping
           this._reading = false 
           
@@ -309,6 +328,34 @@ export default class AddonZmodemWasm {
           // Try to pump again to see if we can recover
           try { this.pumpSender() } catch (_) {}
       }
+  }
+
+  logSenderProgress() {
+      if (!this.sendingFile || !this.term) return
+      
+      const now = Date.now()
+      const timeSinceLastLog = now - this.senderLastLogTime
+      
+      const percent = ((this.senderBytesSent / this.sendingFile.size) * 100).toFixed(2)
+      const elapsed = (now - this.senderStartTime) / 1000
+      const speed = elapsed > 0 ? (this.senderBytesSent / elapsed / 1024 / 1024).toFixed(2) : '0.00'
+      
+      this.term.writeln(`\r[ZMODEM Send] Progress: ${percent}% | Speed: ${speed} MB/s | Sent: ${this.senderBytesSent}/${this.sendingFile.size} bytes`)
+      this.senderLastLogTime = now
+  }
+
+  logReceiverProgress() {
+      if (!this.currentFile || !this.term) return
+      
+      const now = Date.now()
+      const timeSinceLastLog = now - this.receiverLastLogTime
+      
+      const percent = ((this.receiverBytesReceived / this.currentFile.size) * 100).toFixed(2)
+      const elapsed = (now - this.receiverStartTime) / 1000
+      const speed = elapsed > 0 ? (this.receiverBytesReceived / elapsed / 1024 / 1024).toFixed(2) : '0.00'
+      
+      this.term.writeln(`\r[ZMODEM Receive] Progress: ${percent}% | Speed: ${speed} MB/s | Received: ${this.receiverBytesReceived}/${this.currentFile.size} bytes`)
+      this.receiverLastLogTime = now
   }
 
   startReceiver(initialData: Uint8Array) {
@@ -372,6 +419,10 @@ export default class AddonZmodemWasm {
             if (e.type === 'file_start') {
                 this.term?.writeln(`\r\nZMODEM: Receiving ${e.name} (${e.size} bytes)...`)
                 this.currentFile = { name: e.name, size: e.size, data: [] }
+                this.receiverStartTime = Date.now()
+                this.receiverBytesReceived = 0
+                this.receiverLastLogTime = 0
+                this.term?.writeln(`\r[ZMODEM] Receiver initialized for ${e.name}`)
             } else if (e.type === 'file_complete') {
                 this.term?.writeln('\r\nZMODEM: File complete.')
                 this.saveFile()
@@ -387,6 +438,8 @@ export default class AddonZmodemWasm {
         if (chunk && chunk.length > 0) {
             if (this.currentFile) {
                 this.currentFile.data.push(chunk)
+                this.receiverBytesReceived += chunk.length
+                this.logReceiverProgress()
                 didWork = true
             }
         }
